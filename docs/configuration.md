@@ -72,6 +72,6 @@ covers Mamba state and mixed-precision caches, which keep the zero fill). Pages
 are then committed only as blocks are used, so `--gpu-memory-utilization` sizes
 the *capacity* the engine may reach rather than the resident footprint it pays
 for immediately: a 16 GB Mac can give the cache a multi-GB budget while a short
-request only occupies the blocks it writes. A block that a request never writes
-reads as zeros, and the attention kernels mask every slot past the sequence
-length, so the freed capacity does not change results.
+request only occupies the blocks it writes. A slot a request never writes never
+reaches an output — the attention kernels mask every position past the sequence
+length — so the missing zero fill does not change results.

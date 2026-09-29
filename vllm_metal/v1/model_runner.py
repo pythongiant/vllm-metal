@@ -918,10 +918,10 @@ class MetalModelRunner:
                 return [output]
             return [self._extract_logits(output)]
 
-        output = self._target_forward(
-            input_ids, logits_indices=self._profile_logits_indices(input_ids)
-        )
-        return [output.logits]
+        logits_indices = self._profile_logits_indices(input_ids)
+        if logits_indices is None:
+            return [self._extract_logits(self._forward_model(input_ids))]
+        return [self._target_forward(input_ids, logits_indices=logits_indices).logits]
 
     def _profile_logits_indices(self, input_ids: mx.array) -> mx.array | None:
         """Rows a maximal serving step projects logits for, or ``None`` for all.
