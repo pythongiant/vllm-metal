@@ -918,9 +918,40 @@ class MetalModelRunner:
                 return [output]
             return [self._extract_logits(output)]
 
-        output = self._forward_model(input_ids)
-        logits = self._extract_logits(output)
-        return [logits]
+        output = self._target_forward(
+            input_ids, logits_indices=self._profile_logits_indices(input_ids)
+        )
+        return [output.logits]
+
+    def _profile_logits_indices(self, input_ids: mx.array) -> mx.array | None:
+        """Rows a maximal serving step projects logits for, or ``None`` for all.
+
+        The paged forward projects only the rows
+        :meth:`_paged_logits_layout` selects: every decode row (one per
+        request, ``1 + num_speculative_tokens`` when drafting) plus one row per
+        prompt that completes prefill in the step. Profiling the whole packed
+        batch instead reserves a vocabulary-sized tensor for every packed row —
+        ``max_num_batched_tokens x vocab`` bf16 is ~2.5 GB at the 8192-token
+        default — out of the KV budget, halving the capacity the engine can
+        actually use.
+
+        ``None`` keeps the full-row projection whenever selection cannot apply
+        (multimodal, pipeline parallel, LoRA) or the batch is smaller than the
+        rows a step can sample.
+        """
+        if not self._selective_logits_supported:
+            return None
+        rows = int(input_ids.shape[-1])
+        speculative = self.vllm_config.speculative_config
+        num_speculative_tokens = (
+            0 if speculative is None else int(speculative.num_speculative_tokens)
+        )
+        max_sampled_rows = self.scheduler_config.max_num_seqs * (
+            1 + num_speculative_tokens
+        )
+        if max_sampled_rows >= rows:
+            return None
+        return mx.arange(rows - max_sampled_rows, rows, dtype=mx.int32)
 
     def build_paged_attention_runtime(
         self, *, block_size: int
