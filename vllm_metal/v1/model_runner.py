@@ -938,6 +938,16 @@ class MetalModelRunner:
         ``None`` keeps the full-row projection whenever selection cannot apply
         (multimodal, pipeline parallel, LoRA) or the batch is smaller than the
         rows a step can sample.
+
+        This is the *sampler's* worst case. A step whose batch carries a
+        prompt-logprobs request projects a logits row for every packed prompt
+        position instead — ``needs_prompt_logprob_rows`` skips both pruning
+        paths — so those steps can exceed the profiled allowance by up to
+        ``max_num_batched_tokens x vocab x dtype size`` (the whole-batch logits
+        tensor). That path is opt-in per request and cannot be disabled by
+        configuration: vLLM caps ``prompt_logprobs`` at ``max_logprobs``, but
+        ``prompt_logprobs=0`` is still accepted. ``_start_paged_forward``
+        warns once when a step first takes it.
         """
         if not self._selective_logits_supported:
             return None
@@ -1364,6 +1374,18 @@ class MetalModelRunner:
                 needs_prompt_logprob_rows = self._prompt_logprobs_tracker.wants_any(
                     pr.req_id for pr in prefill_reqs
                 )
+                if needs_prompt_logprob_rows:
+                    # The profiled activation allowance covers the rows the
+                    # sampler reads (see _profile_logits_indices); this step
+                    # projects every packed prompt position instead, so say so
+                    # once rather than letting the KV budget look inclusive.
+                    logger.warning_once(
+                        "A step with prompt logprobs projects a logits row for every "
+                        "packed prompt position — up to max_num_batched_tokens x vocab "
+                        "— which the profiled activation allowance does not reserve. "
+                        "Lower --gpu-memory-utilization if these requests share a "
+                        "large KV cache."
+                    )
                 if (
                     intermediate_only
                     and self._intermediate_forward_supported
