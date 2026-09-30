@@ -23,7 +23,6 @@ from __future__ import annotations
 import mlx.core as mx
 import pytest
 import torch
-from vllm.config import AttentionConfig
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -34,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.utils import allocate_kv_cache
 
+from vllm_metal.attention.caches import storage as storage_module
 from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.metal import get_ops
 
@@ -103,7 +103,34 @@ def test_attention_only_config_is_allocated_uninitialized():
     config = _attention_config()
     assert not config.needs_kv_cache_zeroing
     storage = KVCacheStorage(config)
-    assert storage.nbytes == next(iter(storage.tensors.values())).untyped_storage().nbytes()
+    assert (
+        storage.nbytes
+        == next(iter(storage.tensors.values())).untyped_storage().nbytes()
+    )
+
+
+def test_uniform_caches_skip_vllms_zero_filling_allocator(monkeypatch):
+    """A revert of the lazy path must fail here, not merely cost memory.
+
+    The layout assertions below hold for both allocations, so they cannot tell
+    the two apart. This pins the contract itself: a uniform-precision cache
+    never goes through vLLM's zero-filling allocator, while a Mamba cache still
+    does.
+    """
+    delegated: list[KVCacheConfig] = []
+    original = storage_module.allocate_kv_cache
+
+    def spy(config, *args, **kwargs):
+        delegated.append(config)
+        return original(config, *args, **kwargs)
+
+    monkeypatch.setattr(storage_module, "allocate_kv_cache", spy)
+
+    KVCacheStorage(_attention_config())
+    assert delegated == []
+
+    KVCacheStorage(_hybrid_config())
+    assert len(delegated) == 1
 
 
 def test_uninitialized_backing_matches_upstream_layout():
@@ -151,10 +178,22 @@ def _run_decode(ctx: int, tail_is_nan: bool) -> mx.array:
     query = mx.random.normal(shape=(1, num_q_heads, head_size), dtype=mx.float32)
     if tail_is_nan:
         # Slots [ctx, blocks * BLOCK_SIZE) are never written by the runtime.
+        # MLX hands back a *new* array from reshape, so an in-place write to the
+        # flattened view stays in that temporary and never reaches the buffers
+        # the kernel reads: carry it back explicitly, then assert the premise so
+        # this arm cannot silently stop testing anything.
+        filled = []
         for cache in (key_cache, value_cache):
             flat = cache.reshape(blocks * BLOCK_SIZE, num_kv_heads, head_size)
             flat[ctx:] = float("nan")
+            filled.append(flat.reshape(cache.shape))
+        key_cache, value_cache = filled
     mx.eval(key_cache, value_cache, query)
+    if tail_is_nan:
+        for name, cache in (("key", key_cache), ("value", value_cache)):
+            flat = cache.reshape(blocks * BLOCK_SIZE, num_kv_heads, head_size)
+            assert bool(mx.all(mx.isnan(flat[ctx:]))), f"{name} NaN tail missing"
+            assert bool(mx.all(mx.isfinite(flat[:ctx]))), f"{name} written rows changed"
 
     out = mx.array(0)
     get_ops().paged_attention_primitive(

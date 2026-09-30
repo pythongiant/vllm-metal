@@ -33,7 +33,6 @@ import argparse
 import json
 import os
 import re
-import statistics
 import subprocess
 import sys
 import threading
@@ -174,7 +173,9 @@ GPU_MEMORY_UTILIZATION = 0.5
 REPS = 3
 
 KV_CACHE_RE = re.compile(r"KV cache size:\s*([\d,]+)\s*tokens")
-SHARED_CACHE_RE = re.compile(r"Shared attention cache:\s*([\d,]+)\s*blocks,\s*([\d.]+)\s*GiB")
+SHARED_CACHE_RE = re.compile(
+    r"Shared attention cache:\s*([\d,]+)\s*blocks,\s*([\d.]+)\s*GiB"
+)
 METAL_MEMORY_RE = re.compile(r"Metal memory:\s*(.+?)\s+total,\s*(.+?)\s+available")
 
 
@@ -203,7 +204,7 @@ class RssSampler:
                 break
             self._stop.wait(self._interval_s)
 
-    def __enter__(self) -> "RssSampler":
+    def __enter__(self) -> RssSampler:
         self._peak = 0
         self._thread.start()
         return self
@@ -280,9 +281,7 @@ class CaseResult:
             "decode_tok_s": decode_tokens / decode_s,
             "total_tok_s": (run.prompt_tokens + run.output_tokens) / run.wall_s,
             "ttft_ms": self.prefill_ms,
-            "prefill_tok_s": (
-                run.prompt_tokens / prefill_s if prefill_s > 0 else 0.0
-            ),
+            "prefill_tok_s": (run.prompt_tokens / prefill_s if prefill_s > 0 else 0.0),
             "rss_peak_mb": run.rss_peak_mb,
             "maxrss_mb": self.maxrss_mb,
             "mlx_active_mb": self.mlx_active_mb,
@@ -391,7 +390,7 @@ def _resolve_model(tag: str) -> Path:
     except Exception as exc:  # pragma: no cover - operator guidance
         raise SystemExit(
             f"{repo_id} is not in the local Hugging Face cache ({exc}). "
-            "Fetch it once with: python -c \"from huggingface_hub import "
+            'Fetch it once with: python -c "from huggingface_hub import '
             f"snapshot_download; snapshot_download('{repo_id}')\""
         ) from exc
 
@@ -401,7 +400,9 @@ def _resolve_model(tag: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _run_child(tag: str, reps: int, only: tuple[str, ...]) -> tuple[dict[str, Any], str]:
+def _run_child(
+    tag: str, reps: int, only: tuple[str, ...]
+) -> tuple[dict[str, Any], str]:
     cmd = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -454,8 +455,12 @@ def _aggregate(payloads: list[dict[str, Any]], logs: str) -> dict[str, Any]:
                 max((case["ttft_ms"] for case in cases.values()), default=0.0),
             ),
             "ttft_ms_short": cases.get("decode_b8", {}).get("ttft_ms", 0.0),
-            "peak_rss_mb": max((case["rss_peak_mb"] for case in cases.values()), default=0.0),
-            "maxrss_mb": max((case["maxrss_mb"] for case in cases.values()), default=0.0),
+            "peak_rss_mb": max(
+                (case["rss_peak_mb"] for case in cases.values()), default=0.0
+            ),
+            "maxrss_mb": max(
+                (case["maxrss_mb"] for case in cases.values()), default=0.0
+            ),
             "mlx_active_mb": max(
                 (case["mlx_active_mb"] for case in cases.values()), default=0.0
             ),
