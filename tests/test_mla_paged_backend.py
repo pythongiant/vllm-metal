@@ -413,6 +413,49 @@ class TestMLAPagedAttentionWrapperPagedPath:
         assert bool(mx.any(written != 0))
         assert not bool(mx.any(untouched != 0))
 
+    def test_nan_in_unwritten_slots_does_not_reach_the_mla_gather(self) -> None:
+        # The latent gather starts from a whole-block read, so a block's
+        # unwritten tail only stays out of the softmax because the gather slices
+        # to the sequence length first. Fill that tail with NaN and both lanes
+        # must still produce the same finite output as the zeroed pool.
+        inner = _MinimalMLAInner()
+        x = mx.random.normal((1, 1, _HIDDEN)).astype(mx.float16)
+
+        def run(*, nan_tail: bool) -> mx.array:
+            cache = self._make_cache()
+            latent = cache.latent_caches[0]
+            flat = latent.reshape(-1, latent.shape[-1])
+            # Positions 0..2 are written; slot 3 of the same block is not.
+            flat[:3] = mx.arange(3 * latent.shape[-1], dtype=latent.dtype).reshape(
+                3, latent.shape[-1]
+            )
+            if nan_tail:
+                flat[3] = float("nan")
+            cache.latent_caches[0] = flat.reshape(latent.shape)
+            mx.eval(cache.latent_caches[0])
+            if nan_tail:
+                assert bool(mx.any(mx.isnan(cache.latent_caches[0][0, 3])))
+
+            wrapper = MLAPagedAttentionWrapper(inner, layer_idx=0, latent_cache=cache)
+            pac.set_context(
+                pac.PagedAttentionContext(
+                    slot_mapping=[2],
+                    block_tables=[[0]],
+                    context_lens=[3],
+                    cu_seqlens=[0, 1],
+                    offsets=[2],
+                )
+            )
+            out = wrapper(x, mask=None, cache=None)
+            mx.eval(out)
+            return out
+
+        zeroed = run(nan_tail=False)
+        nan_filled = run(nan_tail=True)
+
+        assert bool(mx.all(mx.isfinite(nan_filled)))
+        assert bool(mx.array_equal(nan_filled, zeroed))
+
     def test_two_decode_requests_combined_output_shape(self) -> None:
         # Two decode requests in one batch — outputs must be concatenated along seq axis.
         inner = _MinimalMLAInner()

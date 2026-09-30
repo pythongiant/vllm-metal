@@ -237,6 +237,66 @@ def test_block_head_in_context_is_read_from_the_cache() -> None:
     np.testing.assert_allclose(np.array(got), ref, atol=1.5e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("window", [128, None])
+def test_nan_in_unwritten_slots_does_not_reach_the_recompute(window) -> None:
+    """Slots past the sequence length are never gathered, so they cannot leak.
+
+    The runtime writes every position below ``seq_len`` before a reader sees the
+    block, so only a block's tail is ever unwritten. Both readers in this path —
+    the tiled kernel for the base output and ``apply_bidirectional_segments``
+    for the image rows — must mask those slots rather than fold their values in.
+    ``_setup`` is not used here because its table starts at block id 1, which
+    would put the tail on a block the table maps *inside* the sequence.
+    """
+    n, seq_len = 256, 600  # 600 is not a multiple of the 16-token block size
+    b0, b1 = 400, 600
+    mx.random.seed(1)
+    nblocks = (seq_len + BLOCK - 1) // BLOCK
+    key_cache = mx.random.normal((nblocks, BLOCK, KV_HEADS, HD)).astype(DTYPE)
+    value_cache = mx.random.normal((nblocks, BLOCK, KV_HEADS, HD)).astype(DTYPE)
+    query = mx.random.normal((n, HEADS, HD)).astype(DTYPE)
+    table = mx.array([list(range(nblocks))], dtype=mx.int32)
+    mx.eval(key_cache, value_cache, query, table)
+
+    def nan_tail(cache):
+        # Positions [seq_len, blocks * BLOCK) are never written by the runtime.
+        flat = cache.reshape(-1, KV_HEADS, HD)
+        flat[seq_len:] = float("nan")
+        filled = flat.reshape(cache.shape)
+        mx.eval(filled)
+        return filled
+
+    def run(*, tail_is_nan: bool):
+        keys = nan_tail(key_cache) if tail_is_nan else key_cache
+        values = nan_tail(value_cache) if tail_is_nan else value_cache
+        out = _kernel(query, keys, values, table, n=n, seq_len=seq_len, window=window)
+        got = apply_bidirectional_segments(
+            out,
+            query,
+            keys,
+            values,
+            block_tables=table,
+            block_size=BLOCK,
+            cu_seqlens=[0, n],
+            context_lens=[seq_len],
+            ctx=_ctx(n, seq_len, [(b0, b1)]),
+            window=window,
+            scale=HD**-0.5,
+            head_dim=HD,
+            softcap=0.0,
+            sinks=None,
+            turboquant=False,
+        )
+        mx.eval(got)
+        return got
+
+    zeroed = run(tail_is_nan=False)
+    nan_filled = run(tail_is_nan=True)
+
+    assert bool(mx.all(mx.isfinite(nan_filled)))
+    np.testing.assert_array_equal(np.array(nan_filled), np.array(zeroed))
+
+
 def test_ranges_outside_the_queries_leave_the_output_untouched() -> None:
     n, seq_len = 32, 200
     key_cache, value_cache, query, table = _setup(3, n=n, seq_len=seq_len)

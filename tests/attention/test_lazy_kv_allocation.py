@@ -113,24 +113,51 @@ def test_uniform_caches_skip_vllms_zero_filling_allocator(monkeypatch):
     """A revert of the lazy path must fail here, not merely cost memory.
 
     The layout assertions below hold for both allocations, so they cannot tell
-    the two apart. This pins the contract itself: a uniform-precision cache
-    never goes through vLLM's zero-filling allocator, while a Mamba cache still
-    does.
+    the two apart. This pins the contract instead: a uniform-precision cache
+    never takes vLLM's *zero-filling* allocation — either it does not call the
+    upstream allocator at all (mirrored fallback) or it calls it with
+    ``zero_fill=False`` — while a Mamba cache still does take the filled one.
     """
-    delegated: list[KVCacheConfig] = []
+    delegated: list[dict] = []
     original = storage_module.allocate_kv_cache
 
     def spy(config, *args, **kwargs):
-        delegated.append(config)
+        delegated.append(kwargs)
         return original(config, *args, **kwargs)
 
     monkeypatch.setattr(storage_module, "allocate_kv_cache", spy)
 
     KVCacheStorage(_attention_config())
-    assert delegated == []
+    assert all(kwargs.get("zero_fill") is False for kwargs in delegated), (
+        "a uniform cache must never take vLLM's zero-filling allocation"
+    )
 
+    delegated.clear()
     KVCacheStorage(_hybrid_config())
     assert len(delegated) == 1
+    assert delegated[0].get("zero_fill") is not False
+
+
+def test_upstream_zero_fill_option_is_used_when_available(monkeypatch):
+    """The mirrored allocation is a fallback, not the primary path.
+
+    A vLLM release that carries ``allocate_kv_cache(..., zero_fill=False)``
+    (vllm-project/vllm#59432) must be asked for it, so the copy can be deleted
+    once the pinned version has the keyword.
+    """
+    calls: list[dict] = []
+    original = storage_module.allocate_kv_cache
+
+    def fake_allocate(config, device, layout, *args, **kwargs):
+        calls.append(kwargs)
+        return original(config, device, layout)
+
+    monkeypatch.setattr(storage_module, "allocate_kv_cache", fake_allocate)
+    monkeypatch.setattr(storage_module, "_VLLM_TAKES_ZERO_FILL", True)
+
+    KVCacheStorage(_attention_config())
+
+    assert calls == [{"zero_fill": False}]
 
 
 def test_uninitialized_backing_matches_upstream_layout():

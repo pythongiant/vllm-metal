@@ -76,6 +76,56 @@ def assert_parity(case):
     return output, reference
 
 
+def _nan_unwritten_tails(case) -> None:
+    """Fill the slots past each history inside its last referenced block."""
+    cache = case.cache
+    block_size = cache.block_size
+    planes = (
+        "key_caches",
+        "value_caches",
+        "key_scale_caches",
+        "value_scale_caches",
+        "key_zero_caches",
+    )
+    for i, ctx_len in enumerate(case.ctx.context_lens):
+        tail = (-ctx_len) % block_size
+        if tail == 0:
+            continue
+        block = case.ctx.block_tables[i][(ctx_len - 1) // block_size]
+        for name in planes:
+            array = getattr(cache, name)[0]
+            if array.shape[1] != block_size:
+                continue
+            flat = array.reshape(array.shape[0], block_size, -1)
+            flat[block, block_size - tail :] = float("nan")
+            getattr(cache, name)[0] = flat.reshape(array.shape)
+    mx.eval(*(getattr(cache, name)[0] for name in planes))
+
+
+def test_nan_in_unwritten_slots_does_not_reach_the_prefill_lane(
+    prefill_backend,
+) -> None:
+    """The lane materializes whole blocks, so its tail slots get dequantized.
+
+    A history rarely fills its last block, and those slots hold whatever the
+    pool was allocated with: zero when the fill runs, uninitialized when a
+    platform skips it. The attention masks them either way.
+    """
+    pristine = build_case(qlens=(128,), context_lens=(257,))
+    expected = pristine.forward()
+    mx.eval(expected)
+
+    dirty = build_case(qlens=(128,), context_lens=(257,))
+    _nan_unwritten_tails(dirty)
+    got = dirty.forward()
+    mx.eval(got)
+
+    assert bool(mx.all(mx.isfinite(got)))
+    np.testing.assert_array_equal(
+        np.array(got.astype(mx.float32)), np.array(expected.astype(mx.float32))
+    )
+
+
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize(
     ("k_quant", "v_quant"),

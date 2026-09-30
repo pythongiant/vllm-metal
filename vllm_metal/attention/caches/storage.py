@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections.abc import Mapping, Sequence
+from inspect import signature
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,6 +26,19 @@ from vllm_metal.pytorch_backend.tensor_bridge import (
 )
 
 
+def _vllm_allocator_takes_zero_fill() -> bool:
+    """Whether this vLLM can skip the fill (vllm-project/vllm#59432)."""
+    try:
+        return "zero_fill" in signature(allocate_kv_cache).parameters
+    except (TypeError, ValueError):  # pragma: no cover - no introspectable signature
+        return False
+
+
+# Resolved once at import: the fallback below is the only consumer, and probing
+# per allocation would put an introspection call on the model-load path.
+_VLLM_TAKES_ZERO_FILL = _vllm_allocator_takes_zero_fill()
+
+
 def allocate_kv_cache_lazily(
     config: KVCacheConfig,
     layout: KVCacheLayout,
@@ -43,16 +57,28 @@ def allocate_kv_cache_lazily(
     ``KVCacheConfig.needs_kv_cache_zeroing`` marks Mamba state (read before it
     is written) and mixed-precision caches (a block reinterpreted under another
     precision would decode stale bytes as NaN/Inf). Uniform-precision attention
-    caches skip per-block zeroing upstream, and their kernels mask every slot
-    past the sequence length, so unwritten memory never reaches an output. Keep
-    vLLM's allocation verbatim in that case.
+    caches skip per-block zeroing upstream, and their readers — the tiled
+    prefill kernel, the MLA latent gather and the bidirectional recompute —
+    mask or slice away every slot past the sequence length, so unwritten memory
+    never reaches an output. ``tests/attention/test_lazy_kv_allocation.py``,
+    ``test_bidi_prefill_kernel.py`` and ``test_mla_paged_backend.py`` pin that.
+    Keep vLLM's allocation verbatim in the zeroing case.
 
-    The layer views are built by vLLM's own :func:`create_kv_cache_views`, so
-    the layout (sizes, strides, offsets, dtype) is identical either way;
-    ``tests/attention/test_lazy_kv_allocation.py`` pins that equality.
+    Two ways to get the fill skipped: vLLM releases that carry
+    ``allocate_kv_cache(..., zero_fill=False)`` (vllm-project/vllm#59432) are
+    called with it, and older ones fall back to the mirrored allocation below.
+    The mirror goes away once the pinned vLLM has the keyword.
     """
     if config.needs_kv_cache_zeroing:
         return allocate_kv_cache(config, torch.device("cpu"), layout)
+
+    if _VLLM_TAKES_ZERO_FILL:
+        return allocate_kv_cache(
+            config,
+            torch.device("cpu"),
+            layout,
+            zero_fill=False,
+        )
 
     sizes = {tensor.size for tensor in config.kv_cache_tensors}
     if len(sizes) != 1:
